@@ -1,0 +1,192 @@
+name: Commit Project Duration Updater
+
+on:
+  push:
+    branches:
+      - "*"
+
+jobs:
+  update-project:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      repository-projects: write
+
+    steps:
+      # STEP 1 — Extract Issue + Duration
+      - name: Extract Issue Number and Duration
+        run: |
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+
+          ISSUE_NUMBER=$(echo "$COMMIT_MSG" | grep -oE '#[0-9]+' | head -n 1 | tr -d '#')
+          DURATION=$(echo "$COMMIT_MSG" | grep -oE '\[[0-9]+\]' | head -n 1 | tr -d '[]')
+
+          echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> "$GITHUB_ENV"
+          echo "DURATION=$DURATION" >> "$GITHUB_ENV"
+
+      # STEP 2 — Get Project ID from Project Number
+      - name: Get Project ID
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+          IS_ORG: ${{ vars.IS_ORG }}
+        run: |
+          if [ "$IS_ORG" = "true" ]; then
+            echo "Resolving as Organization Project"
+
+            PROJECT_ID=$(gh api graphql -f query='
+              query($owner:String!, $number:Int!) {
+                organization(login:$owner) {
+                  projectV2(number:$number) {
+                    id
+                  }
+                }
+              }' \
+              -f owner="$OWNER" \
+              -F number="$PROJECT_NUMBER" \
+              --jq '.data.organization.projectV2.id')
+          else
+            echo "Resolving as User Project"
+
+            PROJECT_ID=$(gh api graphql -f query='
+              query($owner:String!, $number:Int!) {
+                user(login:$owner) {
+                  projectV2(number:$number) {
+                    id
+                  }
+                }
+              }' \
+              -f owner="$OWNER" \
+              -F number="$PROJECT_NUMBER" \
+              --jq '.data.user.projectV2.id')
+          fi
+
+          echo "PROJECT_ID=$PROJECT_ID" >> "$GITHUB_ENV"
+
+      # STEP 3 — Get Field ID from Field Name
+      - name: Get Field ID
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          PROJECT_ID: ${{ env.PROJECT_ID }}
+          FIELD_NAME: ${{ vars.PROJECT_FIELD_NAME }}
+        run: |
+          FIELD_ID=$(gh api graphql -f query='
+            query($project:ID!) {
+              node(id:$project) {
+                ... on ProjectV2 {
+                  fields(first:50) {
+                    nodes {
+                      ... on ProjectV2FieldCommon {
+                        id
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }' \
+            -f project="$PROJECT_ID" \
+            --jq '.data.node.fields.nodes[] | select(.name=="'"$FIELD_NAME"'") | .id')
+
+          echo "FIELD_ID=$FIELD_ID" >> "$GITHUB_ENV"
+
+      # STEP 4 — Get Project Item From Issue
+      - name: Get Project Item ID
+        if: env.ISSUE_NUMBER != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ISSUE_NUMBER: ${{ env.ISSUE_NUMBER }}
+        run: |
+          ITEM_ID=$(gh api graphql -f query='
+            query($owner:String!, $repo:String!, $issue:Int!) {
+              repository(owner:$owner, name:$repo) {
+                issue(number:$issue) {
+                  projectItems(first:10) {
+                    nodes {
+                      id
+                    }
+                  }
+                }
+              }
+            }' \
+            -f owner="$OWNER" \
+            -f repo="$REPO" \
+            -F issue="$ISSUE_NUMBER" \
+            --jq '.data.repository.issue.projectItems.nodes[0].id')
+
+          echo "ITEM_ID=$ITEM_ID" >> "$GITHUB_ENV"
+
+      # STEP 5 — Read Existing Duration Value
+      - name: Read Existing Duration
+        if: env.ITEM_ID != '' && env.FIELD_ID != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          ITEM_ID: ${{ env.ITEM_ID }}
+          FIELD_ID: ${{ env.FIELD_ID }}
+        run: |
+          CURRENT_DURATION=$(gh api graphql -f query='
+            query($item:ID!) {
+              node(id:$item) {
+                ... on ProjectV2Item {
+                  fieldValues(first:50) {
+                    nodes {
+                      ... on ProjectV2ItemFieldNumberValue {
+                        number
+                        field {
+                          ... on ProjectV2FieldCommon {
+                            id
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }' \
+            -f item="$ITEM_ID" \
+            --jq '.data.node.fieldValues.nodes[]
+              | select(.field.id=="'"$FIELD_ID"'")
+              | .number' | head -n 1)
+
+          if [ -z "$CURRENT_DURATION" ]; then
+            CURRENT_DURATION=0
+          fi
+
+          echo "CURRENT_DURATION=$CURRENT_DURATION" >> "$GITHUB_ENV"
+
+      # STEP 6 — Add New Duration To Existing
+      - name: Calculate New Duration
+        if: env.DURATION != ''
+        run: |
+          NEW_DURATION=$(echo "$CURRENT_DURATION + $DURATION" | bc)
+          echo "NEW_DURATION=$NEW_DURATION" >> "$GITHUB_ENV"
+
+      # STEP 7 — Update Duration Field
+      - name: Update Duration Field
+        if: env.ITEM_ID != '' && env.NEW_DURATION != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          PROJECT_ID: ${{ env.PROJECT_ID }}
+          FIELD_ID: ${{ env.FIELD_ID }}
+          ITEM_ID: ${{ env.ITEM_ID }}
+          NEW_DURATION: ${{ env.NEW_DURATION }}
+        run: |
+          gh api graphql -f query='
+            mutation($project:ID!, $item:ID!, $field:ID!, $value:Float!) {
+              updateProjectV2ItemFieldValue(input:{
+                projectId:$project
+                itemId:$item
+                fieldId:$field
+                value:{ number:$value }
+              }) {
+                projectV2Item { id }
+              }
+            }' \
+            -f project="$PROJECT_ID" \
+            -f item="$ITEM_ID" \
+            -f field="$FIELD_ID" \
+            -F value="$NEW_DURATION"
