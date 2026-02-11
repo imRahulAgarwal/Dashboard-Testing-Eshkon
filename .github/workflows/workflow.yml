@@ -158,7 +158,7 @@ jobs:
 
           echo "CURRENT_DURATION=$CURRENT_DURATION" >> "$GITHUB_ENV"
 
-      # STEP 6 — Add New Duration To Existing
+      # STEP 6 — Add New Duration To Existing Duration
       - name: Calculate New Duration
         if: env.DURATION != ''
         run: |
